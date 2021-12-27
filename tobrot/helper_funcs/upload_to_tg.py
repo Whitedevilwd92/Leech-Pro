@@ -1,553 +1,748 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# (c) Shrimadhav U K | gautamajay52
- 
+# (c) YashDK [yash-dk@github]
+# (c) modified by AmirulAndalib [amirulandalib@github]
+
 import asyncio
 import logging
 import os
-import re
 import shutil
-import subprocess
 import time
-from functools import partial
-from pathlib import Path
- 
-import pyrogram.types as pyrogram
-import requests
+import traceback
+
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
-from hurry.filesize import size
-from PIL import Image
-from pyrogram.errors import FloodWait, MessageNotModified
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
-from pyrogram.types import InputMediaAudio, InputMediaDocument, InputMediaVideo
-from requests.utils import requote_uri
-from tobrot import (
-    DESTINATION_FOLDER,
-    DOWNLOAD_LOCATION,
-    EDIT_SLEEP_TIME_OUT,
-    INDEX_LINK,
-    LOGGER,
-    RCLONE_CONFIG,
-    TG_MAX_FILE_SIZE,
-    UPLOAD_AS_DOC,
-    gDict,
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaVideo,
 )
-from tobrot.helper_funcs.copy_similar_file import copy_file
-from tobrot.helper_funcs.display_progress import humanbytes, Progress
-from tobrot.helper_funcs.help_Nekmo_ffmpeg import take_screen_shot
-from tobrot.helper_funcs.split_large_files import split_large_files
- 
-# stackoverflow🤐
-def getFolderSize(p):
-    prepend = partial(os.path.join, p)
-    return sum(
-        [
-            (os.path.getsize(f) if os.path.isfile(f) else getFolderSize(f))
-            for f in map(prepend, os.listdir(p))
-        ]
-    )
- 
- 
-async def upload_to_tg(
+from telethon.errors import VideoContentTypeInvalidError
+from telethon.tl.types import KeyboardButtonCallback
+from telethon.utils import get_attributes
+
+from .. import user_db
+from ..core import (
+    thumb_manage,
+)  # i guess i will dodge this one ;) as i am importing the vids helper anyways
+from ..core.database_handle import TtkUpload
+from ..core.getVars import get_val
+from . import vids_helpers, zip7_utils
+from .Ftele import upload_file
+from .progress_for_pyrogram import progress_for_pyrogram
+from .progress_for_telethon import progress
+
+torlog = logging.getLogger(__name__)
+
+# thanks @SpEcHiDe for this concept of recursion
+async def upload_handel(
+    path,
     message,
-    local_file_name,
-    from_user,
-    dict_contatining_uploaded_files,
-    client,
-    edit_media=False,
-    yt_thumb=None,
+    from_uid,
+    files_dict,
+    job_id=0,
+    force_edit=False,
+    updb=None,
+    from_in=False,
+    thumb_path=None,
+    user_msg=None,
+    task=None,
 ):
-    base_file_name = os.path.basename(local_file_name)
-    caption_str = ""
-    caption_str += "<code>"
-    caption_str += base_file_name
-    caption_str += "</code>"
-    if os.path.isdir(local_file_name):
-        directory_contents = os.listdir(local_file_name)
+    # creting here so connections are kept low
+    if updb is None:
+        # Central object is not used its Acknowledged
+        updb = TtkUpload()
+
+    # logging.info("Uploading Now:- {}".format(path))
+
+    if os.path.isdir(path):
+        logging.info("Uploading the directory:- {}".format(path))
+
+        directory_contents = os.listdir(path)
         directory_contents.sort()
-        # number_of_files = len(directory_contents)
-        LOGGER.info(directory_contents)
-        new_m_esg = message
-        if not message.photo:
-            new_m_esg = await message.reply_text(
-                f"Found {len(directory_contents)} files <a href='tg://user?id={from_user}'>🤒</a>",
-                quote=True
-                # reply_to_message_id=message.message_id
+        try:
+            # maybe way to refresh?!
+            message = await message.client.get_messages(
+                message.chat_id, ids=[message.id]
             )
-        for single_file in directory_contents:
-            # recursion: will this FAIL somewhere?
-            await upload_to_tg(
-                new_m_esg,
-                os.path.join(local_file_name, single_file),
-                from_user,
-                dict_contatining_uploaded_files,
-                client,
-                edit_media,
-                yt_thumb,
-            )
-    else:
-        if os.path.getsize(local_file_name) > TG_MAX_FILE_SIZE:
-            LOGGER.info("TODO")
-            d_f_s = humanbytes(os.path.getsize(local_file_name))
-            i_m_s_g = await message.reply_text(
-                "Telegram does not support uploading this file.\n"
-                f"Detected File Size: {d_f_s} 😡\n"
-                "\n🤖 trying to split the files 🌝🌝🌚"
-            )
-            splitted_dir = await split_large_files(local_file_name)
-            totlaa_sleif = os.listdir(splitted_dir)
-            totlaa_sleif.sort()
-            number_of_files = len(totlaa_sleif)
-            LOGGER.info(totlaa_sleif)
-            ba_se_file_name = os.path.basename(local_file_name)
-            await i_m_s_g.edit_text(
-                f"Detected File Size: {d_f_s} 😡\n"
-                f"<code>{ba_se_file_name}</code> splitted into {number_of_files} files.\n"
-                "trying to upload to Telegram, now ..."
-            )
-            for le_file in totlaa_sleif:
-                # recursion: will this FAIL somewhere?
-                await upload_to_tg(
-                    message,
-                    os.path.join(splitted_dir, le_file),
-                    from_user,
-                    dict_contatining_uploaded_files,
-                    client,
-                    edit_media,
-                    yt_thumb,
+            message = message[0]
+        except:
+            pass
+
+        try:
+            message = await message.edit(
+                "{}\n\n**Found** {} **files for this Telegram Upload**".format(
+                    message.text, len(directory_contents)
                 )
-        else:
-            sizze = os.path.getsize(local_file_name)
-            sent_message = await upload_single_file(
-                message,
-                local_file_name,
-                caption_str,
-                from_user,
-                client,
-                edit_media,
-                yt_thumb,
             )
-            if sent_message is not None:
-                dict_contatining_uploaded_files[
-                    os.path.basename(local_file_name)
-                ] = sent_message.message_id
+        except:
+            torlog.warning("Too much folders will stop the editing of this message")
+
+        if not from_in:
+            updb.register_upload(message.chat_id, message.id)
+            if user_msg is None:
+                sup_mes = await message.get_reply_message()
             else:
-                return
-    # await message.delete()
-    return dict_contatining_uploaded_files
- 
- 
-# © gautamajay52 thanks to Rclone team for this wonderful tool.🧘
- 
- 
-async def upload_to_gdrive(file_upload, message, messa_ge, g_id):
-    await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-    del_it = await message.edit_text(
-        f"<a href='tg://user?id={g_id}'>🔊</a> Now Uploading to ☁️ Cloud!!!"
-    )
-    if not os.path.exists("rclone.conf"):
-        with open("rclone.conf", "w+", newline="\n", encoding="utf-8") as fole:
-            fole.write(f"{RCLONE_CONFIG}")
-    if os.path.exists("rclone.conf"):
-        with open("rclone.conf", "r+") as file:
-            con = file.read()
-            gUP = re.findall("\[(.*)\]", con)[0]
-            LOGGER.info(gUP)
-    destination = f"{DESTINATION_FOLDER}"
-    file_upload = str(Path(file_upload).resolve())
-    LOGGER.info(file_upload)
-    if os.path.isfile(file_upload):
-        g_au = [
-            "rclone",
-            "copy",
-            "--config=rclone.conf",
-            f"{file_upload}",
-            f"{gUP}:{destination}",
-            "-v",
-        ]
-        LOGGER.info(g_au)
-        tmp = await asyncio.create_subprocess_exec(
-            *g_au, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        pro, cess = await tmp.communicate()
-        LOGGER.info(pro.decode("utf-8"))
-        LOGGER.info(cess.decode("utf-8"))
-        gk_file = re.escape(os.path.basename(file_upload))
-        LOGGER.info(gk_file)
-        with open("filter.txt", "w+", encoding="utf-8") as filter:
-            print(f"+ {gk_file}\n- *", file=filter)
- 
-        t_a_m = [
-            "rclone",
-            "lsf",
-            "--config=rclone.conf",
-            "-F",
-            "i",
-            "--filter-from=filter.txt",
-            "--files-only",
-            f"{gUP}:{destination}",
-        ]
-        gau_tam = await asyncio.create_subprocess_exec(
-            *t_a_m, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        # os.remove("filter.txt")
-        gau, tam = await gau_tam.communicate()
-        gautam = gau.decode().strip()
-        LOGGER.info(gau.decode())
-        LOGGER.info(tam.decode())
-        # os.remove("filter.txt")
-        gauti = f"https://drive.google.com/file/d/{gautam}/view?usp=drivesdk"
-        gjay = size(os.path.getsize(file_upload))
-        button = []
-        button.append(
-            [pyrogram.InlineKeyboardButton(text="☁️ CloudUrl ☁️", url=f"{gauti}")]
-        )
-        if INDEX_LINK:
-            indexurl = f"{INDEX_LINK}/{os.path.basename(file_upload)}"
-            tam_link = requests.utils.requote_uri(indexurl)
-            LOGGER.info(tam_link)
-            button.append(
-                [
-                    pyrogram.InlineKeyboardButton(
-                        text="ℹ️ IndexUrl ℹ️", url=f"{tam_link}"
-                    )
-                ]
+                sup_mes = user_msg
+
+            if task is not None:
+                await task.set_message(message)
+                await task.set_original_message(sup_mes)
+
+            data = "upcancel {} {} {}".format(
+                message.chat_id, message.id, sup_mes.sender_id
             )
-        button_markup = pyrogram.InlineKeyboardMarkup(button)
-        await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-        await messa_ge.reply_text(
-            f"🤖: Uploaded successfully `{os.path.basename(file_upload)}` <a href='tg://user?id={g_id}'>🤒</a>\n📀 Size: {gjay}",
-            reply_markup=button_markup,
-        )
-        os.remove(file_upload)
-        await del_it.delete()
+            buts = [KeyboardButtonCallback("Cancel upload.", data.encode("UTF-8"))]
+            message = await message.edit(buttons=buts)
+
+        for file in directory_contents:
+            if updb.get_cancel_status(message.chat_id, message.id):
+                continue
+
+            await upload_handel(
+                os.path.join(path, file),
+                message,
+                from_uid,
+                files_dict,
+                job_id,
+                force_edit,
+                updb,
+                from_in=True,
+                thumb_path=thumb_path,
+                user_msg=user_msg,
+                task=task,
+            )
+
+        if not from_in:
+            if updb.get_cancel_status(message.chat_id, message.id):
+                task.cancel = True
+                await task.set_inactive()
+                await message.edit(
+                    "{} - Canceled By user.".format(message.text), buttons=None
+                )
+            else:
+                await message.edit(buttons=None)
+            updb.deregister_upload(message.chat_id, message.id)
+
     else:
-        tt = os.path.join(destination, os.path.basename(file_upload))
-        LOGGER.info(tt)
-        t_am = [
-            "rclone",
-            "copy",
-            "--config=rclone.conf",
-            f"{file_upload}",
-            f"{gUP}:{tt}",
-            "-v",
-        ]
-        LOGGER.info(t_am)
-        tmp = await asyncio.create_subprocess_exec(
-            *t_am, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        pro, cess = await tmp.communicate()
-        LOGGER.info(pro.decode("utf-8"))
-        LOGGER.info(cess.decode("utf-8"))
-        g_file = re.escape(os.path.basename(file_upload))
-        LOGGER.info(g_file)
-        with open("filter1.txt", "w+", encoding="utf-8") as filter1:
-            print(f"+ {g_file}/\n- *", file=filter1)
- 
-        g_a_u = [
-            "rclone",
-            "lsf",
-            "--config=rclone.conf",
-            "-F",
-            "i",
-            "--filter-from=filter1.txt",
-            "--dirs-only",
-            f"{gUP}:{destination}",
-        ]
-        gau_tam = await asyncio.create_subprocess_exec(
-            *g_a_u, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        # os.remove("filter1.txt")
-        gau, tam = await gau_tam.communicate()
-        gautam = gau.decode("utf-8")
-        LOGGER.info(gautam)
-        LOGGER.info(tam.decode("utf-8"))
-        # os.remove("filter1.txt")
-        gautii = f"https://drive.google.com/folderview?id={gautam}"
-        gjay = size(getFolderSize(file_upload))
-        LOGGER.info(gjay)
-        button = []
-        button.append(
-            [pyrogram.InlineKeyboardButton(text="☁️ CloudUrl ☁️", url=f"{gautii}")]
-        )
-        if INDEX_LINK:
-            indexurl = f"{INDEX_LINK}/{os.path.basename(file_upload)}/"
-            tam_link = requests.utils.requote_uri(indexurl)
-            LOGGER.info(tam_link)
-            button.append(
-                [
-                    pyrogram.InlineKeyboardButton(
-                        text="ℹ️ IndexUrl ℹ️", url=f"{tam_link}"
+        logging.info("Uploading the file:- {}".format(path))
+        if os.path.getsize(path) > get_val("TG_UP_LIMIT"):
+            # the splitted file will be considered as a single upload ;)
+
+            metadata = extractMetadata(createParser(path))
+
+            if metadata is not None:
+                # handle none for unknown
+                metadata = metadata.exportDictionary()
+                try:
+                    mime = metadata.get("Common").get("MIME type")
+                except:
+                    mime = metadata.get("Metadata").get("MIME type")
+
+                ftype = mime.split("/")[0]
+                ftype = ftype.lower().strip()
+            else:
+                ftype = "unknown"
+
+            if ftype == "video":
+                todel = await message.reply(
+                    "**FILE LARGER THAN 2GB, SPLITTING NOW...**\n**Using Algo FFMPEG VIDEO SPLIT**"
+                )
+                split_dir = await vids_helpers.split_file(path, get_val("TG_UP_LIMIT"))
+                await todel.delete()
+            else:
+                todel = await message.reply(
+                    "**FILE LARGER THAN 2GB, SPLITTING NOW...**\n**`Using Algo FFMPEG ZIP SPLIT`**"
+                )
+                split_dir = await zip7_utils.split_in_zip(path, get_val("TG_UP_LIMIT"))
+                await todel.delete()
+
+            if task is not None:
+                await task.add_a_dir(split_dir)
+
+            dircon = os.listdir(split_dir)
+            dircon.sort()
+
+            if not from_in:
+                updb.register_upload(message.chat_id, message.id)
+                if user_msg is None:
+                    sup_mes = await message.get_reply_message()
+                else:
+                    sup_mes = user_msg
+
+                if task is not None:
+                    await task.set_message(message)
+                    await task.set_original_message(sup_mes)
+
+                data = "upcancel {} {} {}".format(
+                    message.chat_id, message.id, sup_mes.sender_id
+                )
+                buts = [KeyboardButtonCallback("Cancel upload.", data.encode("UTF-8"))]
+                await message.edit(buttons=buts)
+
+            for file in dircon:
+                if updb.get_cancel_status(message.chat_id, message.id):
+                    continue
+
+                await upload_handel(
+                    os.path.join(split_dir, file),
+                    message,
+                    from_uid,
+                    files_dict,
+                    job_id,
+                    force_edit,
+                    updb=updb,
+                    from_in=True,
+                    thumb_path=thumb_path,
+                    user_msg=user_msg,
+                    task=task,
+                )
+
+            try:
+                shutil.rmtree(split_dir)
+                os.remove(path)
+            except:
+                pass
+
+            if not from_in:
+                if updb.get_cancel_status(message.chat_id, message.id):
+                    task.cancel = True
+                    await task.set_inactive()
+                    await message.edit(
+                        "{} - Canceled By user.".format(message.text), buttons=None
                     )
-                ]
-            )
-        button_markup = pyrogram.InlineKeyboardMarkup(button)
-        await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-        await messa_ge.reply_text(
-            f"🤖: Uploaded successfully `{os.path.basename(file_upload)}` <a href='tg://user?id={g_id}'>🤒</a>\n📀 Size: {gjay}",
-            reply_markup=button_markup,
-        )
-        shutil.rmtree(file_upload)
-        await del_it.delete()
- 
- 
-#
- 
- 
-async def upload_single_file(
-    message, local_file_name, caption_str, from_user, client, edit_media, yt_thumb
+                else:
+                    await message.edit(buttons=None)
+                updb.deregister_upload(message.chat_id, message.id)
+            # spliting file logic blah blah
+        else:
+            if not from_in:
+                updb.register_upload(message.chat_id, message.id)
+                if user_msg is None:
+                    sup_mes = await message.get_reply_message()
+                else:
+                    sup_mes = user_msg
+
+                if task is not None:
+                    await task.set_message(message)
+                    await task.set_original_message(sup_mes)
+
+                if task is not None:
+                    await task.set_message(message)
+                    await task.set_original_message(sup_mes)
+
+                data = "upcancel {} {} {}".format(
+                    message.chat_id, message.id, sup_mes.sender_id
+                )
+                buts = [KeyboardButtonCallback("Cancel upload.", data.encode("UTF-8"))]
+                await message.edit(buttons=buts)
+            # print(updb)
+            if black_list_exts(path):
+                if task is not None:
+                    await task.uploaded_file(os.path.basename(path))
+                sentmsg = None
+            else:
+                sentmsg = await upload_a_file(
+                    path, message, force_edit, updb, thumb_path, user_msg=user_msg
+                )
+
+            if not from_in:
+                if updb.get_cancel_status(message.chat_id, message.id):
+                    task.cancel = True
+                    await task.set_inactive()
+                    await message.edit(
+                        "{} - Canceled By user.".format(message.text), buttons=None
+                    )
+                else:
+                    await message.edit(buttons=None)
+                updb.deregister_upload(message.chat_id, message.id)
+
+            if sentmsg is not None:
+                if task is not None:
+                    await task.uploaded_file(os.path.basename(path))
+                files_dict[os.path.basename(path)] = sentmsg.id
+
+    return files_dict
+
+
+async def upload_a_file(
+    path, message, force_edit, database=None, thumb_path=None, user_msg=None
 ):
-    await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-    local_file_name = str(Path(local_file_name).resolve())
+    if get_val("EXPRESS_UPLOAD"):
+        return await upload_single_file(
+            path, message, force_edit, database, thumb_path, user_msg
+        )
+    queue = message.client.queue
+    if database is not None:
+        if database.get_cancel_status(message.chat_id, message.id):
+            # add os remove here
+            return None
+    if not os.path.exists(path):
+        return None
+
+    if user_msg is None:
+        user_msg = await message.get_reply_message()
+
+    # todo improve this uploading âœ”ï¸
+    file_name = os.path.basename(path)
+    caption_str = ""
+    caption_str += "<b>"
+    caption_str += file_name
+    caption_str += "</b>"
+    metadata = extractMetadata(createParser(path))
+
+    if metadata is not None:
+        # handle none for unknown
+        metadata = metadata.exportDictionary()
+        try:
+            mime = metadata.get("Common").get("MIME type")
+        except:
+            mime = metadata.get("Metadata").get("MIME type")
+
+        ftype = mime.split("/")[0]
+        ftype = ftype.lower().strip()
+    else:
+        ftype = "unknown"
+    # print(metadata)
+
+    if not force_edit:
+        data = "upcancel {} {} {}".format(
+            message.chat_id, message.id, user_msg.sender_id
+        )
+        buts = [KeyboardButtonCallback("Cancel upload.", data.encode("UTF-8"))]
+        msg = await message.reply("**Uploading:** `{}`".format(file_name), buttons=buts)
+
+    else:
+        msg = message
+
+    uploader_id = None
+    if queue is not None:
+        torlog.info(f"Waiting for the worker here for {file_name}")
+        msg = await msg.edit(f"{msg.text}\nWaiting for a uploaders to get free... ")
+        uploader_id = await queue.get()
+        torlog.info(
+            f"Waiting over for the worker here for {file_name} aquired worker {uploader_id}"
+        )
+
+    out_msg = None
+    start_time = time.time()
+    tout = get_val("EDIT_SLEEP_SECS")
+    opath = path
+
+    if user_msg is not None:
+        dis_thumb = user_db.get_var("DISABLE_THUMBNAIL", user_msg.sender_id)
+        if dis_thumb is False or dis_thumb is None:
+            thumb_path = user_db.get_thumbnail(user_msg.sender_id)
+            if not thumb_path:
+                thumb_path = None
+
+    try:
+        if get_val("FAST_UPLOAD"):
+            torlog.info("Fast upload is enabled")
+            with open(path, "rb") as filee:
+                path = await upload_file(
+                    message.client,
+                    filee,
+                    file_name,
+                    lambda c, t: progress(
+                        c, t, msg, file_name, start_time, tout, message, database
+                    ),
+                )
+
+        if user_msg is not None:
+            force_docs = user_db.get_var("FORCE_DOCUMENTS", user_msg.sender_id)
+        else:
+            force_docs = None
+
+        if force_docs is None:
+            force_docs = get_val("FORCE_DOCUMENTS")
+
+        if message.media and force_edit:
+            out_msg = await msg.edit(file=path, text=caption_str)
+        else:
+
+            if ftype == "video" and not force_docs:
+                try:
+                    if thumb_path is not None:
+                        thumb = thumb_path
+                    else:
+                        thumb = await thumb_manage.get_thumbnail(opath)
+                except:
+                    thumb = None
+                    torlog.exception("Error in thumb")
+                try:
+                    attrs, _ = get_attributes(opath, supports_streaming=True)
+                    out_msg = await msg.client.send_file(
+                        msg.to_id,
+                        file=path,
+                        parse_mode="html",
+                        thumb=thumb,
+                        caption=caption_str,
+                        reply_to=message.id,
+                        supports_streaming=True,
+                        progress_callback=lambda c, t: progress(
+                            c, t, msg, file_name, start_time, tout, message, database
+                        ),
+                        attributes=attrs,
+                    )
+                except VideoContentTypeInvalidError:
+                    attrs, _ = get_attributes(opath, force_document=True)
+                    torlog.warning("Streamable file send failed fallback to document.")
+                    out_msg = await msg.client.send_file(
+                        msg.to_id,
+                        file=path,
+                        parse_mode="html",
+                        caption=caption_str,
+                        thumb=thumb,
+                        reply_to=message.id,
+                        force_document=True,
+                        progress_callback=lambda c, t: progress(
+                            c, t, msg, file_name, start_time, tout, message, database
+                        ),
+                        attributes=attrs,
+                    )
+                except Exception:
+                    torlog.error("Error:- {}".format(traceback.format_exc()))
+            elif ftype == "audio" and not force_docs:
+                # not sure about this if
+                attrs, _ = get_attributes(opath)
+                out_msg = await msg.client.send_file(
+                    msg.to_id,
+                    file=path,
+                    parse_mode="html",
+                    caption=caption_str,
+                    reply_to=message.id,
+                    progress_callback=lambda c, t: progress(
+                        c, t, msg, file_name, start_time, tout, message, database
+                    ),
+                    attributes=attrs,
+                )
+            else:
+                if force_docs:
+                    attrs, _ = get_attributes(opath, force_document=True)
+                    out_msg = await msg.client.send_file(
+                        msg.to_id,
+                        file=path,
+                        parse_mode="html",
+                        caption=caption_str,
+                        reply_to=message.id,
+                        force_document=True,
+                        progress_callback=lambda c, t: progress(
+                            c, t, msg, file_name, start_time, tout, message, database
+                        ),
+                        attributes=attrs,
+                        thumb=thumb_path,
+                    )
+                else:
+                    attrs, _ = get_attributes(opath)
+                    out_msg = await msg.client.send_file(
+                        msg.to_id,
+                        file=path,
+                        parse_mode="html",
+                        caption=caption_str,
+                        reply_to=message.id,
+                        progress_callback=lambda c, t: progress(
+                            c, t, msg, file_name, start_time, tout, message, database
+                        ),
+                        attributes=attrs,
+                        thumb=thumb_path,
+                    )
+    except Exception as e:
+        if str(e).find("cancel") != -1:
+            torlog.info("Canceled an upload lol")
+            await msg.edit(f"Failed to upload {e}", buttons=None)
+        else:
+            torlog.exception("In Tele Upload")
+            await msg.edit(f"Failed to upload {e}", buttons=None)
+    finally:
+        if queue is not None:
+            await queue.put(uploader_id)
+            torlog.info(f"Freed uploader with id {uploader_id}")
+
+    if out_msg is None:
+        return None
+    if out_msg.id != msg.id:
+        await msg.delete()
+
+    return out_msg
+
+
+def black_list_exts(file):
+    for i in ["!qb"]:
+        if str(file).lower().endswith(i):
+            return True
+
+    return False
+
+
+# async def upload_single_file(message, local_file_name, caption_str, from_user, edit_media):
+async def upload_single_file(
+    path, message, force_edit, database=None, thumb_image_path=None, user_msg=None
+):
+    if database is not None:
+        if database.get_cancel_status(message.chat_id, message.id):
+            # add os remove here
+            return None
+    if not os.path.exists(path):
+        return None
+
+    queue = message.client.exqueue
+
+    file_name = os.path.basename(path)
+    caption_str = ""
+    caption_str += "<b>"
+    caption_str += file_name
+    caption_str += "</b>"
+
+    if user_msg is None:
+        user_msg = await message.get_reply_message()
+
+    if user_msg is not None:
+        force_docs = user_db.get_var("FORCE_DOCUMENTS", user_msg.sender_id)
+    else:
+        force_docs = None
+
+    if force_docs is None:
+        force_docs = get_val("FORCE_DOCUMENTS")
+
+    # Avoid Flood in Express
+    await asyncio.sleep(6)
+
+    metadata = extractMetadata(createParser(path))
+
+    if metadata is not None:
+        # handle none for unknown
+        metadata = metadata.exportDictionary()
+        try:
+            mime = metadata.get("Common").get("MIME type")
+        except:
+            mime = metadata.get("Metadata").get("MIME type")
+
+        ftype = mime.split("/")[0]
+        ftype = ftype.lower().strip()
+    else:
+        ftype = "unknown"
+
+    thonmsg = message
+    message = await message.client.pyro.get_messages(message.chat_id, message.id)
+    tout = get_val("EDIT_SLEEP_SECS")
     sent_message = None
     start_time = time.time()
     #
-    thumbnail_location = os.path.join(
-        DOWNLOAD_LOCATION, "thumbnails", str(from_user) + ".jpg"
-    )
-    # LOGGER.info(thumbnail_location)
-    if UPLOAD_AS_DOC.upper() == "TRUE":  # todo
-        thumb = None
-        thumb_image_path = None
-        if os.path.exists(thumbnail_location):
-            thumb_image_path = await copy_file(
-                thumbnail_location, os.path.dirname(os.path.abspath(local_file_name))
-            )
-            thumb = thumb_image_path
-        message_for_progress_display = message
-        if not edit_media:
-            message_for_progress_display = await message.reply_text(
-                "<b>Trying to upload</b>\n\n📙<b> File Name</b>: <code>{}</code>".format(os.path.basename(local_file_name))
-            )
-            prog = Progress(from_user, client, message_for_progress_display)
-        sent_message = await message.reply_document(
-            document=local_file_name,
-            thumb=thumb,
-            caption=caption_str,
-            parse_mode="html",
-            disable_notification=True,
-            progress=prog.progress_for_pyrogram,
-            progress_args=(
-                "",
-                start_time,
-            ),
-        )
-        if message.message_id != message_for_progress_display.message_id:
-            try:
-                await message_for_progress_display.delete()
-            except FloodWait as gf:
-                time.sleep(gf.x)
-            except Exception as rr:
-                LOGGER.warning(str(rr))
-        os.remove(local_file_name)
-        if thumb is not None:
-            os.remove(thumb)
-    else:
-        try:
-            message_for_progress_display = message
-            if not edit_media:
-                message_for_progress_display = await message.reply_text(
-                    "<b>Trying to upload</b>\n\n📙<b> File Name</b>: <code>{}</code>".format(os.path.basename(local_file_name))
-                )
-                prog = Progress(from_user, client, message_for_progress_display)
-            if local_file_name.upper().endswith(("MKV", "MP4", "WEBM")):
-                duration = 0
-                try:
-                    metadata = extractMetadata(createParser(local_file_name))
-                    if metadata.has("duration"):
-                        duration = metadata.get("duration").seconds
-                except Exception as g_e:
-                    LOGGER.info(g_e)
-                width = 0
-                height = 0
+    if user_msg is not None:
+        dis_thumb = user_db.get_var("DISABLE_THUMBNAIL", user_msg.sender_id)
+        if dis_thumb is False or dis_thumb is None:
+            thumb_image_path = user_db.get_thumbnail(user_msg.sender_id)
+            if not thumb_image_path:
                 thumb_image_path = None
-                if os.path.exists(thumbnail_location):
-                    thumb_image_path = await copy_file(
-                        thumbnail_location,
-                        os.path.dirname(os.path.abspath(local_file_name)),
-                    )
-                else:
-                    if not yt_thumb:
-                        thumb_image_path = await take_screen_shot(
-                            local_file_name,
-                            os.path.dirname(os.path.abspath(local_file_name)),
-                            (duration / 2),
+    #
+    uploader_id = None
+    try:
+        message_for_progress_display = message
+        if not force_edit:
+            data = "upcancel {} {} {}".format(
+                message.chat.id, message.message_id, user_msg.sender_id
+            )
+            markup = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "Cancel Upload", callback_data=data.encode("UTF-8")
                         )
-                    else:
-                        req = requests.get(yt_thumb)
-                        thumb_image_path = os.path.join(
-                            os.path.dirname(os.path.abspath(local_file_name)),
-                            str(time.time()) + ".jpg",
-                        )
-                        with open(thumb_image_path, "wb") as thum:
-                            thum.write(req.content)
-                        img = Image.open(thumb_image_path).convert("RGB")
-                        img.save(thumb_image_path, format="jpeg")
-                    # get the correct width, height, and duration for videos greater than 10MB
-                    if os.path.exists(thumb_image_path):
-                        metadata = extractMetadata(createParser(thumb_image_path))
-                        if metadata.has("width"):
-                            width = metadata.get("width")
-                        if metadata.has("height"):
-                            height = metadata.get("height")
-                        # ref: https://t.me/PyrogramChat/44663
-                        # https://stackoverflow.com/a/21669827/4723940
-                        Image.open(thumb_image_path).convert("RGB").save(
-                            thumb_image_path
-                        )
-                        img = Image.open(thumb_image_path)
-                        # https://stackoverflow.com/a/37631799/4723940
-                        img.resize((320, height))
-                        img.save(thumb_image_path, "JPEG")
-                        # https://pillow.readthedocs.io/en/3.1.x/reference/Image.html#create-thumbnails
-                #
-                thumb = None
-                if thumb_image_path is not None and os.path.isfile(thumb_image_path):
-                    thumb = thumb_image_path
-                # send video
-                if edit_media and message.photo:
-                    await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-                    sent_message = await message.edit_media(
-                        media=InputMediaVideo(
-                            media=local_file_name,
-                            thumb=thumb,
-                            caption=caption_str,
-                            parse_mode="html",
-                            width=width,
-                            height=height,
-                            duration=duration,
-                            supports_streaming=True,
-                        )
-                        # quote=True,
-                    )
-                else:
-                    sent_message = await message.reply_video(
-                        video=local_file_name,
-                        caption=caption_str,
+                    ]
+                ]
+            )
+            message_for_progress_display = await message.reply_text(
+                "**Starting upload of** `{}`".format(os.path.basename(path)),
+                reply_markup=markup,
+            )
+
+            if queue is not None:
+                torlog.info(f"Waiting for the worker here for {file_name}")
+                message_for_progress_display = await message_for_progress_display.edit(
+                    f"{message_for_progress_display.text}\nWaiting for a uploaders to get free... "
+                )
+                uploader_id = await queue.get()
+                torlog.info(
+                    f"Waiting over for the worker here for {file_name} aquired worker {uploader_id}"
+                )
+
+        if ftype == "video" and not force_docs:
+            metadata = extractMetadata(createParser(path))
+            duration = 0
+            if metadata.has("duration"):
+                duration = metadata.get("duration").seconds
+            #
+            width = 1280
+            height = 720
+            if thumb_image_path is None:
+                thumb_image_path = await thumb_manage.get_thumbnail(path)
+                # get the correct width, height, and duration for videos greater than 10MB
+
+            thumb = None
+            if thumb_image_path is not None and os.path.isfile(thumb_image_path):
+                thumb = thumb_image_path
+
+            # send video
+            if force_edit and message.photo:
+                sent_message = await message.edit_media(
+                    media=InputMediaVideo(
+                        media=path,
+                        thumb=thumb,
                         parse_mode="html",
-                        duration=duration,
                         width=width,
                         height=height,
-                        thumb=thumb,
+                        duration=duration,
                         supports_streaming=True,
-                        disable_notification=True,
-                        progress=prog.progress_for_pyrogram,
-                        progress_args=(
-                            "",
-                            start_time,
-                        ),
-                    )
-                if thumb is not None:
-                    os.remove(thumb)
-            elif local_file_name.upper().endswith(("MP3", "M4A", "M4B", "FLAC", "WAV")):
-                metadata = extractMetadata(createParser(local_file_name))
-                duration = 0
-                title = ""
-                artist = ""
-                if metadata.has("duration"):
-                    duration = metadata.get("duration").seconds
-                if metadata.has("title"):
-                    title = metadata.get("title")
-                if metadata.has("artist"):
-                    artist = metadata.get("artist")
-                thumb_image_path = None
-                if os.path.isfile(thumbnail_location):
-                    thumb_image_path = await copy_file(
-                        thumbnail_location,
-                        os.path.dirname(os.path.abspath(local_file_name)),
-                    )
-                thumb = None
-                if thumb_image_path is not None and os.path.isfile(thumb_image_path):
-                    thumb = thumb_image_path
-                # send audio
-                if edit_media and message.photo:
-                    await asyncio.sleep(EDIT_SLEEP_TIME_OUT)
-                    sent_message = await message.edit_media(
-                        media=InputMediaAudio(
-                            media=local_file_name,
-                            thumb=thumb,
-                            caption=caption_str,
-                            parse_mode="html",
-                            duration=duration,
-                            performer=artist,
-                            title=title,
-                        )
-                    )
-                else:
-                    sent_message = await message.reply_audio(
-                        audio=local_file_name,
                         caption=caption_str,
+                    )
+                    # quote=True,
+                )
+            else:
+                sent_message = await message.reply_video(
+                    video=path,
+                    # quote=True,
+                    parse_mode="html",
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb,
+                    caption=caption_str,
+                    supports_streaming=True,
+                    disable_notification=True,
+                    # reply_to_message_id=message.reply_to_message.message_id,
+                    progress=progress_for_pyrogram,
+                    progress_args=(
+                        f"{os.path.basename(path)}",
+                        message_for_progress_display,
+                        start_time,
+                        tout,
+                        thonmsg.client.pyro,
+                        message,
+                        database,
+                        markup,
+                    ),
+                )
+            if thumb is not None:
+                os.remove(thumb)
+        elif ftype == "audio" and not force_docs:
+            metadata = extractMetadata(createParser(path))
+            duration = 0
+            title = ""
+            artist = ""
+            if metadata.has("duration"):
+                duration = metadata.get("duration").seconds
+            if metadata.has("title"):
+                title = metadata.get("title")
+            if metadata.has("artist"):
+                artist = metadata.get("artist")
+
+            thumb = None
+            if thumb_image_path is not None and os.path.isfile(thumb_image_path):
+                thumb = thumb_image_path
+            # send audio
+            if force_edit and message.photo:
+                sent_message = await message.edit_media(
+                    media=InputMediaAudio(
+                        media=path,
+                        thumb=thumb,
                         parse_mode="html",
                         duration=duration,
                         performer=artist,
                         title=title,
-                        thumb=thumb,
-                        disable_notification=True,
-                        progress=prog.progress_for_pyrogram,
-                        progress_args=(
-                            "",
-                            start_time,
-                        ),
-                    )
-                if thumb is not None:
-                    os.remove(thumb)
-            else:
-                thumb_image_path = None
-                if os.path.isfile(thumbnail_location):
-                    thumb_image_path = await copy_file(
-                        thumbnail_location,
-                        os.path.dirname(os.path.abspath(local_file_name)),
-                    )
-                # if a file, don't upload "thumb"
-                # this "diff" is a major derp -_- 😔😭😭
-                thumb = None
-                if thumb_image_path is not None and os.path.isfile(thumb_image_path):
-                    thumb = thumb_image_path
-                #
-                # send document
-                if edit_media and message.photo:
-                    sent_message = await message.edit_media(
-                        media=InputMediaDocument(
-                            media=local_file_name,
-                            thumb=thumb,
-                            caption=caption_str,
-                            parse_mode="html",
-                        )
-                    )
-                else:
-                    sent_message = await message.reply_document(
-                        document=local_file_name,
-                        thumb=thumb,
                         caption=caption_str,
-                        parse_mode="html",
-                        disable_notification=True,
-                        progress=prog.progress_for_pyrogram,
-                        progress_args=(
-                            "",
-                            start_time,
-                        ),
                     )
-                if thumb is not None:
-                    os.remove(thumb)
- 
-        except MessageNotModified as oY:
-            LOGGER.info(oY)
-        except FloodWait as g:
-            LOGGER.info(g)
-            time.sleep(g.x)
-        except Exception as e:
-            LOGGER.info(e)
-            await message_for_progress_display.edit_text("**FAILED**\n" + str(e))
+                    # quote=True,
+                )
+            else:
+                sent_message = await message.reply_audio(
+                    audio=path,
+                    # quote=True,
+                    parse_mode="html",
+                    duration=duration,
+                    performer=artist,
+                    title=title,
+                    caption=caption_str,
+                    thumb=thumb,
+                    disable_notification=True,
+                    # reply_to_message_id=message.reply_to_message.message_id,
+                    progress=progress_for_pyrogram,
+                    progress_args=(
+                        f"{os.path.basename(path)}",
+                        message_for_progress_display,
+                        start_time,
+                        tout,
+                        thonmsg.client.pyro,
+                        message,
+                        database,
+                        markup,
+                    ),
+                )
+            if thumb is not None:
+                os.remove(thumb)
         else:
-            if message.message_id != message_for_progress_display.message_id:
-                try:
-                    if sent_message is not None:
-                        await message_for_progress_display.delete()
-                except FloodWait as gf:
-                    time.sleep(gf.x)
-                except Exception as rr:
-                    LOGGER.warning(str(rr))
-                    await asyncio.sleep(5)
-        os.remove(local_file_name)
+            # if a file, don't upload "thumb"
+            # this "diff" is a major derp -_- ðŸ˜”ðŸ˜­ðŸ˜­
+            thumb = None
+            if thumb_image_path is not None and os.path.isfile(thumb_image_path):
+                thumb = thumb_image_path
+            #
+            # send document
+            if force_edit and message.photo:
+                sent_message = await message.edit_media(
+                    media=InputMediaDocument(
+                        media=path, caption=caption_str, thumb=thumb, parse_mode="html"
+                    )
+                    # quote=True,
+                )
+            else:
+                sent_message = await message.reply_document(
+                    document=path,
+                    # quote=True,
+                    thumb=thumb,
+                    parse_mode="html",
+                    disable_notification=True,
+                    # reply_to_message_id=message.reply_to_message.message_id,
+                    progress=progress_for_pyrogram,
+                    caption=caption_str,
+                    progress_args=(
+                        f"{os.path.basename(path)}",
+                        message_for_progress_display,
+                        start_time,
+                        tout,
+                        thonmsg.client.pyro,
+                        message,
+                        database,
+                        markup,
+                    ),
+                )
+            if thumb is not None:
+                os.remove(thumb)
+    except Exception as e:
+        if str(e).find("cancel") != -1:
+            torlog.info("Canceled an upload lol")
+            try:
+                await message_for_progress_display.edit(f"Failed to upload {e}")
+            except:
+                pass
+        else:
+            try:
+                await message_for_progress_display.edit(f"Failed to upload {e}")
+            except:
+                pass
+            torlog.exception("IN Pyro upload")
+    else:
+        if message.message_id != message_for_progress_display.message_id:
+            await message_for_progress_display.delete()
+    finally:
+        if queue is not None and uploader_id is not None:
+            await queue.put(uploader_id)
+            torlog.info(f"Freed uploader with id {uploader_id}")
+    # os.remove(path)
+    if sent_message is None:
+        return None
+    sent_message = await thonmsg.client.get_messages(
+        sent_message.chat.id, ids=sent_message.message_id
+    )
     return sent_message
